@@ -1,0 +1,139 @@
+name: Point - Corrected installer (8.32.2)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    env:
+      WEBVIEW2_SDK_VERSION: "1.0.4191.47"
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Check installer source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($file in @('build.bat','build_installer.bat','installer/Point.iss','src/point_install_check.cpp')) {
+            if (!(Test-Path -LiteralPath $file -PathType Leaf)) {
+              throw "Missing $file. Upload the extracted package contents at the repository root."
+            }
+          }
+          $config = Get-Content -LiteralPath 'installer/Point.iss'
+          foreach ($line in @('AppVersion=8.32.2','DefaultDirName={autopf}\Point-Hardened','UsePreviousAppDir=no','PrivilegesRequired=admin','OutputBaseFilename=Point-Hardened-8.32.2-Setup')) {
+            if ($config -notcontains $line) { throw "Incorrect installer configuration: expected $line" }
+          }
+          Write-Host 'Corrected installer source confirmed: Program Files\Point-Hardened.'
+
+      - name: Build Point
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          if (!(Test-Path $vswhere)) { throw 'Visual Studio locator was not found.' }
+          $installation = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (!$installation) { throw 'The Visual C++ x64 build tools were not found.' }
+          $vcvars = Join-Path $installation 'VC\Auxiliary\Build\vcvars64.bat'
+          if (!(Test-Path $vcvars)) { throw 'vcvars64.bat was not found.' }
+          if (!(Get-Command nuget.exe -ErrorAction SilentlyContinue)) { throw 'NuGet is missing from this runner.' }
+          $buildCommand = 'call "{0}" && call build.bat' -f $vcvars
+          & cmd.exe /d /s /c $buildCommand
+          if ($LASTEXITCODE -ne 0) { throw "Point build failed with exit code $LASTEXITCODE." }
+          foreach ($exe in @('Point.exe', 'PointFetcher.exe', 'PointBrowserFetcher.exe', 'PointInstallCheck.exe')) {
+            if (!(Test-Path "build/$exe")) { throw "Missing build output: $exe" }
+          }
+
+      - name: Build single-file installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $iscc = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6/ISCC.exe'
+          if (!(Test-Path $iscc)) { throw 'Inno Setup 6 is missing from this Windows runner.' }
+          $env:ISCC = $iscc
+          & cmd.exe /d /c "build_installer.bat --skip-build"
+          if ($LASTEXITCODE -ne 0) { throw 'Point installer compilation failed.' }
+
+      - name: Verify installer and account setup
+        shell: pwsh
+        run: |
+          $account = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+          $setup = Start-Process -FilePath './build-installer/Point-Hardened-8.32.2-Setup.exe' -ArgumentList @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',"/POINTUSER=$account",'/POINTEXPORT=1','/LOG=point-setup-test.log') -Wait -PassThru
+          if ($setup.ExitCode -ne 0) { throw "Installer failed: $($setup.ExitCode). See point-setup-test.log." }
+          & "$env:ProgramFiles/Point-Hardened/PointInstallCheck.exe"
+          if ($LASTEXITCODE -ne 0) { throw 'Installed policy verification failed.' }
+          $sid = ([Security.Principal.NTAccount]$account).Translate([Security.Principal.SecurityIdentifier]).Value
+          foreach ($group in @('Point Users','Point Exporters')) {
+            $members = @(Get-LocalGroupMember -Group $group)
+            if (!($members | Where-Object { $_.SID.Value -eq $sid })) { throw "Missing membership: $group" }
+          }
+
+      - name: Verify reinstall
+        shell: pwsh
+        run: |
+          $account = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+          $setup = Start-Process -FilePath './build-installer/Point-Hardened-8.32.2-Setup.exe' -ArgumentList @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',"/POINTUSER=$account",'/POINTEXPORT=1','/LOG=point-reinstall-test.log') -Wait -PassThru
+          if ($setup.ExitCode -ne 0) { throw "Reinstall failed: $($setup.ExitCode)." }
+          & "$env:ProgramFiles/Point-Hardened/PointInstallCheck.exe"
+          if ($LASTEXITCODE -ne 0) { throw 'Reinstalled policy verification failed.' }
+
+      - name: Verify legacy shortcut repair
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $desktop = [Environment]::GetFolderPath('Desktop')
+          New-Item -ItemType Directory -Force $desktop | Out-Null
+          $linkPath = Join-Path $desktop 'Point-CI-Legacy.lnk'
+          $shell = New-Object -ComObject WScript.Shell
+          $shortcut = $shell.CreateShortcut($linkPath)
+          $shortcut.TargetPath = Join-Path $env:LOCALAPPDATA 'Programs/Point/Point.exe'
+          $shortcut.Save()
+          try {
+            & "$env:ProgramFiles/Point-Hardened/PointInstallCheck.exe" --refresh-shortcuts
+            if ($LASTEXITCODE -ne 0) { throw 'Legacy shortcut repair failed.' }
+            $updated = $shell.CreateShortcut($linkPath)
+            if ($updated.TargetPath -ne "$env:ProgramFiles\Point-Hardened\Point.exe") { throw 'Legacy shortcut target was not updated.' }
+          } finally {
+            Remove-Item -LiteralPath $linkPath -ErrorAction SilentlyContinue
+          }
+
+      - name: Verify repair from a legacy location
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $legacy = Join-Path $env:RUNNER_TEMP 'Point-Legacy-Test'
+          New-Item -ItemType Directory -Force $legacy | Out-Null
+          Copy-Item 'build/Point.exe','build/PointInstallCheck.exe','build/point-security.conf' $legacy
+          $account = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+          & "$legacy/PointInstallCheck.exe" --repair-install $account
+          if ($LASTEXITCODE -ne 0) { throw 'Legacy repair failed.' }
+          & "$env:ProgramFiles/Point-Hardened/PointInstallCheck.exe"
+          if ($LASTEXITCODE -ne 0) { throw 'Repaired installation did not pass policy checks.' }
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: Point-Hardened-8.32.2-Setup
+          path: build-installer/Point-Hardened-8.32.2-Setup.exe
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload setup test log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Point-Setup-Diagnostics
+          path: |
+            point-setup-test.log
+            point-reinstall-test.log
+          if-no-files-found: ignore

@@ -1,0 +1,1 @@
+Synthetic ZIP container fixtures for structural validation only. clean.xlsx is not a functional spreadsheet. renamed-macro.xlsx includes a dummy macro entry, not executable macro code. oversized.xlsx declares excessive uncompressed size. Do not open these files in Excel; pass this directory to security_regression_test.
